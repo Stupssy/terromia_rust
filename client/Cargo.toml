@@ -8,3 +8,4 @@ shared = { path = "../shared" }
 bevy = "0.18.1"
 bevy_renet = "4.0.1"
 bincode = "1.3.3"
+log = "0.4.29"

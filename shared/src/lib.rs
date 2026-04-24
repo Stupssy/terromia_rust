@@ -1,6 +1,8 @@
 pub mod blocks;
+pub mod storage;
 
 pub use blocks::{BlockDefinition, BlockKey, BLOCK_DEFINITIONS, blocks, is_solid};
+pub use storage::{Database, DatabaseConfig};
 
 use bitflags::bitflags;
 use glam::{IVec3, Vec3};

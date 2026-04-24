@@ -149,8 +149,10 @@ pub fn is_block_solid(cache: &ChunkDataCache, world_pos: Vec3) -> bool {
 
         if local_x < 16 && local_y < 16 && local_z < 16 {
             let idx = local_x + local_y * 16 + local_z * 256;
-            let block_id = chunk_data[idx] as u32;
-            return is_solid(block_id);
+            if idx < chunk_data.len() {
+                let block_id = chunk_data[idx] as u32;
+                return is_solid(block_id);
+            }
         }
     }
     false

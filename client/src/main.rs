@@ -817,6 +817,11 @@ fn receive_network_messages(
             }
             ServerMessage::ChunkData { key, data } => {
                 let chunk_vec = data.into_vec();
+                // Validate chunk data size before using
+                if chunk_vec.len() != CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE {
+                    log::warn!("Received chunk with invalid size: {} (expected {}), ignoring", chunk_vec.len(), CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+                    continue;
+                }
                 chunk_data_cache.0.insert(key, chunk_vec.clone());
                 rebuild_chunk_entity(
                     &mut commands,

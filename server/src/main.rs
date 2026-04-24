@@ -5,9 +5,9 @@ use noise::{NoiseFn, Perlin};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_netcode::{NetcodeServerTransport, ServerAuthentication, ServerConfig};
 use shared::{
-    blocks, BlockKey, chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags,
-    PlayerSnapshot, ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, GRAVITY,
-    PLAYER_HEIGHT, PROTOCOL_ID, TICK_RATE,
+    blocks, BlockKey, chunk_index, ChunkKey, ClientMessage, Database, DiscoveryMessage,
+    InputFlags, PlayerSnapshot, ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE,
+    GRAVITY, PLAYER_HEIGHT, PROTOCOL_ID, TICK_RATE,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -63,15 +63,17 @@ struct World {
     chunks: HashMap<ChunkKey, Vec<u8>>,
     players: HashMap<u64, Player>,
     view_distance: i32,
+    db: Option<(sqlx::PgPool, tokio::runtime::Handle)>,
 }
 
 impl World {
-    fn new(config: &ServerConfigData) -> Self {
+    fn new(config: &ServerConfigData, db: Option<(sqlx::PgPool, tokio::runtime::Handle)>) -> Self {
         Self {
             perlin: Perlin::new(config.world_seed),
             chunks: HashMap::new(),
             players: HashMap::new(),
             view_distance: config.view_distance,
+            db,
         }
     }
 
@@ -95,7 +97,31 @@ impl World {
                 );
                 let key = ChunkKey::from_world_pos(player_pos + offset);
                 if !self.chunks.contains_key(&key) {
+                    // Try to load from database first
+                    if let Some((pool, handle)) = &self.db {
+                        if let Ok(Some(data)) = handle.block_on(async {
+                            load_chunk_from_db(pool, key).await
+                        }) {
+                            // Validate chunk data size
+                            if data.len() == CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE {
+                                self.chunks.insert(key, data);
+                                continue;
+                            } else {
+                                warn!("Chunk data from DB has wrong size: {} (expected {}), regenerating", data.len(), CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+                            }
+                        }
+                    }
+                    // Generate if not in database or data is invalid
                     let data = generate_chunk_data(&self.perlin, key);
+                    // Save newly generated chunk to database
+                    if let Some((pool, handle)) = &self.db {
+                        let key_clone = key;
+                        let data_clone = data.clone();
+                        let pool_clone = pool.clone();
+                        handle.spawn(async move {
+                            let _ = save_chunk_to_db(&pool_clone, key_clone, &data_clone).await;
+                        });
+                    }
                     self.chunks.insert(key, data);
                 }
             }
@@ -203,6 +229,58 @@ impl World {
     }
 }
 
+async fn load_chunk_from_db(pool: &sqlx::PgPool, key: ChunkKey) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let result = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT data FROM chunks WHERE cx = $1 AND cy = $2 AND cz = $3"
+    )
+    .bind(key.0.x)
+    .bind(key.0.y)
+    .bind(key.0.z)
+    .fetch_optional(pool)
+    .await?;
+    Ok(result)
+}
+
+async fn save_chunk_to_db(pool: &sqlx::PgPool, key: ChunkKey, data: &[u8]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO chunks (cx, cy, cz, data) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (cx, cy, cz) DO UPDATE SET data = $4"
+    )
+    .bind(key.0.x)
+    .bind(key.0.y)
+    .bind(key.0.z)
+    .bind(data)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn load_player_from_db(pool: &sqlx::PgPool, player_id: u64) -> Result<Option<(String, Vec3)>, sqlx::Error> {
+    let result = sqlx::query_as::<_, (String, f64, f64, f64)>(
+        "SELECT name, x, y, z FROM players WHERE id = $1"
+    )
+    .bind(player_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(result.map(|(name, x, y, z)| (name, Vec3::new(x as f32, y as f32, z as f32))))
+}
+
+async fn save_player_to_db(pool: &sqlx::PgPool, player_id: u64, name: &str, pos: Vec3) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO players (id, name, x, y, z, inventory, unlocked_schematics, gamemode)
+         VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '[]'::jsonb, 0)
+         ON CONFLICT (id) DO UPDATE SET name = $2, x = $3, y = $4, z = $5"
+    )
+    .bind(player_id.to_string())
+    .bind(name)
+    .bind(pos.x as f64)
+    .bind(pos.y as f64)
+    .bind(pos.z as f64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 struct DiscoveryService {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
@@ -262,6 +340,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_level(log::LevelFilter::Info)
         .init()?;
 
+    // Initialize database in a separate tokio runtime
+    let rt = tokio::runtime::Runtime::new()?;
+    let database = rt.block_on(async {
+        let mut db = Database::new();
+        db.connect().await?;
+        Ok::<_, Box<dyn std::error::Error>>(db)
+    })?;
+
     let cli = Cli::parse();
     let config = load_config(&cli)?;
     info!(
@@ -285,7 +371,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut transport = NetcodeServerTransport::new(server_config, socket)?;
     let mut server = RenetServer::new(ConnectionConfig::default());
-    let mut world = World::new(&config);
+    let db_tuple = database.get().ok().map(|pool| (pool.clone(), rt.handle().clone()));
+    let mut world = World::new(&config, db_tuple);
 
     let summary = Arc::new(Mutex::new(ServerSummary {
         server_name: config.server_name.clone(),
@@ -314,10 +401,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 ServerEvent::ClientConnected { client_id } => {
                     info!("Client {client_id} connected");
-                    let spawn = world.spawn_position();
+
+                    // Try to load player data from database
+                    let (initial_name, spawn) = if let Some((pool, handle)) = &world.db {
+                        handle.block_on(async {
+                            load_player_from_db(pool, client_id).await
+                        }).ok().flatten()
+                    } else {
+                        None
+                    }.unwrap_or_else(|| (format!("Player{client_id}"), world.spawn_position()));
+
                     let player = Player {
                         id: client_id,
-                        name: format!("Player{client_id}"),
+                        name: initial_name.clone(),
                         translation: spawn,
                         last_input: InputFlags::default(),
                         prev_input: InputFlags::default(),
@@ -381,6 +477,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ServerEvent::ClientDisconnected { client_id, reason } => {
                     info!("Client {client_id} disconnected: {reason:?}");
+
+                    // Save player data to database before removing
+                    if let Some(player) = world.players.get(&client_id) {
+                        if let Some((pool, handle)) = &world.db {
+                            let player_id = client_id;
+                            let player_name = player.name.clone();
+                            let player_pos = player.translation;
+                            let pool_clone = pool.clone();
+                            handle.spawn(async move {
+                                let _ = save_player_to_db(&pool_clone, player_id, &player_name, player_pos).await;
+                            });
+                        }
+                    }
+
                     world.players.remove(&client_id);
                     sync_summary(&summary, &server, &config);
                     server.broadcast_message(
