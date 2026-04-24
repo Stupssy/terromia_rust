@@ -1,0 +1,8 @@
+bind_ip = "0.0.0.0"
+game_port = 5000
+discovery_port = 5001
+server_name = "Voxel Rust Server"
+motd = "LAN test server"
+max_clients = 16
+view_distance = 3
+world_seed = 42
