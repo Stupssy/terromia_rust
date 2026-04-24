@@ -17,15 +17,20 @@ use bevy_renet::renet::{ConnectionConfig, DefaultChannel};
 use bevy_renet::{RenetClient, RenetClientPlugin};
 use shared::{
     chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, ServerMessage,
-    ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, GRAVITY, PLAYER_HEIGHT,
-    PLAYER_WIDTH, PROTOCOL_ID,
+    ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, PLAYER_HEIGHT,
+    PROTOCOL_ID, TICK_RATE,
 };
+
+mod physics;
+use physics::{apply_local_prediction, is_block_solid, physics_tick, PhysicsBody, PhysicsPlugin};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+const SNAPSHOT_INTERVAL: f32 = 1.0 / TICK_RATE as f32;
 
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum AppScreen {
@@ -119,15 +124,28 @@ struct PlayerEntity {
 }
 
 #[derive(Component)]
-struct LocalPlayer;
+pub struct LocalPlayer;
 
 #[derive(Component)]
 struct TargetPosition(Vec3);
 
-#[derive(Component, Default)]
-struct PhysicsBody {
-    velocity: Vec3,
-    on_ground: bool,
+#[derive(Component, Clone)]
+struct PlayerSyncState {
+    last_snapshot_time: f32,
+    last_position: Vec3,
+    server_position: Vec3,
+    is_stale: bool,
+}
+
+impl Default for PlayerSyncState {
+    fn default() -> Self {
+        Self {
+            last_snapshot_time: 0.0,
+            last_position: Vec3::ZERO,
+            server_position: Vec3::ZERO,
+            is_stale: false,
+        }
+    }
 }
 
 #[derive(Component)]
@@ -177,6 +195,12 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(RenetClientPlugin)
         .add_plugins(NetcodeClientPlugin)
+        .add_plugins(PhysicsPlugin)
+        .add_systems(
+            Update,
+            apply_local_prediction.run_if(in_state(AppScreen::InGame)),
+        )
+        .add_systems(Update, physics_tick.run_if(in_state(AppScreen::InGame)))
         .init_state::<AppScreen>()
         .insert_resource(discovery_inbox)
         .init_resource::<BrowserState>()
@@ -201,14 +225,14 @@ fn main() {
             receive_network_messages.run_if(resource_exists::<RenetClient>),
         )
         .add_systems(Update, send_player_input.run_if(client_connected))
-        .add_systems(
-            Update,
-            local_player_physics.run_if(in_state(AppScreen::InGame)),
-        )
         .add_systems(Update, mouse_look.run_if(in_state(AppScreen::InGame)))
         .add_systems(
             Update,
             update_player_visuals.run_if(in_state(AppScreen::InGame)),
+        )
+        .add_systems(
+            Update,
+            detect_stale_players.run_if(in_state(AppScreen::InGame)),
         )
         .add_systems(Update, update_camera.run_if(in_state(AppScreen::InGame)))
         .add_systems(
@@ -705,7 +729,10 @@ fn receive_network_messages(
     mut connection: ResMut<ConnectionState>,
     mut menu: ResMut<MenuState>,
     mut chat: ResMut<ChatState>,
+    time: Res<Time>,
     local_player_transform: Query<(Entity, &Transform), With<LocalPlayer>>,
+    // Query to read PlayerSyncState from world for updating
+    sync_states: Query<&PlayerSyncState>,
 ) {
     while let Some(message) = client.receive_message(DefaultChannel::ReliableOrdered) {
         let Ok(message) = bincode::deserialize::<ServerMessage>(&message) else {
@@ -730,8 +757,26 @@ fn receive_network_messages(
             } => {
                 let translation = Vec3::from(translation);
                 if let Some(entity) = cache.players.get(&id).copied() {
+                    // Update existing player
                     commands.entity(entity).insert(TargetPosition(translation));
+                    // Update PlayerSyncState if it exists, else insert new
+                    if let Ok(sync) = sync_states.get(entity) {
+                        let mut new_sync = sync.clone();
+                        new_sync.server_position = translation;
+                        new_sync.last_position = translation;
+                        new_sync.last_snapshot_time = time.elapsed_secs();
+                        new_sync.is_stale = false;
+                        commands.entity(entity).insert(new_sync);
+                    } else {
+                        commands.entity(entity).insert(PlayerSyncState {
+                            last_snapshot_time: time.elapsed_secs(),
+                            last_position: translation,
+                            server_position: translation,
+                            is_stale: false,
+                        });
+                    }
                 } else {
+                    // New player
                     let material = if Some(id) == connection.local_client_id {
                         materials.add(Color::srgb(0.9, 0.2, 0.2))
                     } else {
@@ -741,8 +786,15 @@ fn receive_network_messages(
                         Mesh3d(meshes.add(Cuboid::new(0.8, 1.8, 0.8))),
                         MeshMaterial3d(material),
                         Transform::from_translation(translation),
+                        Visibility::Visible,
                         PlayerEntity { id },
                         TargetPosition(translation),
+                        PlayerSyncState {
+                            last_snapshot_time: time.elapsed_secs(),
+                            last_position: translation,
+                            server_position: translation,
+                            is_stale: false,
+                        },
                         Name::new(name.clone()),
                     ));
                     if Some(id) == connection.local_client_id {
@@ -799,6 +851,7 @@ fn receive_network_messages(
         }
     }
 
+    // ==== UNRELIABLE SNAPSHOT HANDLING (Position Updates) ====
     while let Some(message) = client.receive_message(DefaultChannel::Unreliable) {
         let Ok(ServerMessage::StateSnapshot { tick: _, players }) =
             bincode::deserialize::<ServerMessage>(&message)
@@ -806,28 +859,38 @@ fn receive_network_messages(
             continue;
         };
 
-        // Get local player transform for snap-to check
-        let local_player_info = local_player_transform.single().ok();
-
+        let elapsed = time.elapsed_secs();
         let mut seen = HashMap::new();
+
         for snapshot in players {
             seen.insert(snapshot.id, true);
             let server_pos = Vec3::from(snapshot.translation);
 
             if let Some(entity) = cache.players.get(&snapshot.id).copied() {
                 if Some(snapshot.id) == connection.local_client_id {
-                    // Local player: apply snap-to threshold
-                    if let Some((_entity, transform)) = local_player_info {
-                        let delta = (server_pos - transform.translation).length();
-                        if delta > 0.5 {
-                            // Snap to server position
-                            commands
-                                .entity(entity)
-                                .insert(Transform::from_translation(server_pos));
-                        }
-                    }
+                    // === LOCAL PLAYER: Server Authority mit Client Prediction ===
+                    if let Some((_entity, _transform)) = local_player_transform.single().ok() {}
                 } else {
-                    // Remote player: update TargetPosition
+                    // === REMOTE PLAYER: Interpolation mit Timeout-Detection ===
+                    if let Ok(sync) = sync_states.get(entity) {
+                        // Entity has existing PlayerSyncState: update it
+                        let mut new_sync = sync.clone();
+                        new_sync.last_position = sync.server_position; // Für Interpolation starten
+                        new_sync.server_position = server_pos;
+                        new_sync.last_snapshot_time = elapsed;
+                        new_sync.is_stale = false; // Reset timeout
+                        commands.entity(entity).insert(new_sync);
+                    } else {
+                        // Entity exists but no PlayerSyncState yet: insert fresh one
+                        commands.entity(entity).insert(PlayerSyncState {
+                            last_snapshot_time: elapsed,
+                            last_position: server_pos,
+                            server_position: server_pos,
+                            is_stale: false,
+                        });
+                    }
+
+                    // Update TargetPosition für Lerp
                     commands.entity(entity).insert(TargetPosition(server_pos));
                 }
             } else {
@@ -841,8 +904,16 @@ fn receive_network_messages(
                     Mesh3d(meshes.add(Cuboid::new(0.8, 1.8, 0.8))),
                     MeshMaterial3d(material),
                     Transform::from_translation(server_pos),
+                    Visibility::Visible,
                     PlayerEntity { id: snapshot.id },
                     TargetPosition(server_pos),
+                    PlayerSyncState {
+                        last_snapshot_time: elapsed,
+                        last_position: server_pos,
+                        server_position: server_pos,
+                        is_stale: false,
+                        ..default()
+                    },
                     Name::new(snapshot.name.clone()),
                 ));
                 if Some(snapshot.id) == connection.local_client_id {
@@ -852,6 +923,7 @@ fn receive_network_messages(
             }
         }
 
+        // Cleanup stale players
         let stale: Vec<u64> = cache
             .players
             .keys()
@@ -907,86 +979,68 @@ fn send_player_input(
     }
 }
 
-fn local_player_physics(
+fn update_player_visuals(
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    ui_state: Res<UiState>,
-    camera_state: Res<CameraState>,
-    chunk_data: Res<ChunkDataCache>,
-    mut local_player: Query<(&mut Transform, &mut PhysicsBody), With<LocalPlayer>>,
+    mut query: Query<(&mut Transform, &TargetPosition, &mut PlayerSyncState), Without<LocalPlayer>>,
 ) {
-    if ui_state.pause_open || ui_state.chat_open {
-        return;
-    }
-
-    let Ok((mut transform, mut body)) = local_player.single_mut() else {
-        return;
-    };
-
-    let mut move_dir = Vec3::ZERO;
-    if keys.pressed(KeyCode::KeyW) {
-        move_dir.z -= 1.0;
-    }
-    if keys.pressed(KeyCode::KeyS) {
-        move_dir.z += 1.0;
-    }
-    if keys.pressed(KeyCode::KeyA) {
-        move_dir.x -= 1.0;
-    }
-    if keys.pressed(KeyCode::KeyD) {
-        move_dir.x += 1.0;
-    }
-    if move_dir.length_squared() > 0.0 {
-        move_dir = move_dir.normalize();
-    }
-    let yaw_rotation = Quat::from_axis_angle(Vec3::Y, camera_state.yaw);
-    let wish_dir = yaw_rotation * move_dir;
-
-    let speed = 8.5;
-    body.velocity.x = wish_dir.x * speed;
-    body.velocity.z = wish_dir.z * speed;
-    if keys.just_pressed(KeyCode::Space) && body.on_ground {
-        body.velocity.y = 10.0;
-        body.on_ground = false;
-    }
-
-    let dt = time.delta_secs();
-    body.velocity.y -= GRAVITY * dt;
-
-    let move_y = Vec3::new(0.0, body.velocity.y * dt, 0.0);
-    if !collides_with_world(&chunk_data, transform.translation + move_y) {
-        transform.translation += move_y;
-        body.on_ground = false;
-    } else {
-        if body.velocity.y < 0.0 {
-            body.on_ground = true;
+    let current_time = time.elapsed_secs();
+    for (mut transform, target, mut sync) in &mut query {
+        // === TIMEOUT DETECTION ===
+        let time_since_snapshot = current_time - sync.last_snapshot_time;
+        if time_since_snapshot > 5.0 {
+            sync.is_stale = true;
+            continue;
         }
-        body.velocity.y = 0.0;
-    }
 
-    let move_x = Vec3::new(body.velocity.x * dt, 0.0, 0.0);
-    if !collides_with_world(&chunk_data, transform.translation + move_x) {
-        transform.translation += move_x;
-    } else {
-        body.velocity.x = 0.0;
-    }
+        sync.is_stale = false;
 
-    let move_z = Vec3::new(0.0, 0.0, body.velocity.z * dt);
-    if !collides_with_world(&chunk_data, transform.translation + move_z) {
-        transform.translation += move_z;
-    } else {
-        body.velocity.z = 0.0;
+        // === SMOOTH INTERPOLATION über Snapshot-Interval ===
+        // Interpolate von last_position → server_position
+        let interpolation_t = (time_since_snapshot / SNAPSHOT_INTERVAL).clamp(0.0, 1.0);
+        let interpolated = sync.last_position.lerp(target.0, interpolation_t);
+
+        transform.translation = interpolated;
     }
 }
 
-fn update_player_visuals(
-    time: Res<Time>,
-    mut query: Query<(&mut Transform, &TargetPosition), Without<LocalPlayer>>,
+// === OPTIONAL: Extrapolation für schnellere Updates ===
+// Wenn du willst, dass Player "predictively" sich bewegen:
+#[allow(dead_code)]
+fn extrapolate_remote_players(
+    mut query: Query<
+        (&mut Transform, &PlayerSyncState),
+        (Without<LocalPlayer>, With<PlayerEntity>),
+    >,
 ) {
-    for (mut transform, target) in &mut query {
-        transform.translation = transform
-            .translation
-            .lerp(target.0, (time.delta_secs() * 10.0).clamp(0.0, 1.0));
+    for (mut transform, sync) in &mut query {
+        if sync.is_stale {
+            continue;
+        }
+
+        // Einfache Velocity-Extrapolation basierend auf letzten 2 Snapshots
+        let delta = sync.server_position - sync.last_position;
+        // Extrapoliere um einen Frame voraus (aber nicht zu aggressiv)
+        let extrapolated = sync.server_position + delta * 0.3; // 30% der letzten Bewegung
+
+        transform.translation = transform.translation.lerp(extrapolated, 0.15);
+    }
+}
+
+// === OPTIONAL: Stale Player Detection ===
+fn detect_stale_players(
+    mut query: Query<
+        (&mut Visibility, &PlayerSyncState),
+        (Without<LocalPlayer>, With<PlayerEntity>),
+    >,
+) {
+    for (mut vis, sync) in &mut query {
+        if sync.is_stale {
+            // Optional: Semi-transparent zeigen wenn stale
+            *vis = Visibility::Visible;
+            // Könntest auch: despawn nach 2+ sec timeout
+        } else {
+            *vis = Visibility::Visible;
+        }
     }
 }
 
@@ -1533,61 +1587,6 @@ fn is_air_world(
 ) -> bool {
     let world = key.world_pos() + Vec3::new(x as f32, y as f32, z as f32);
     !is_block_solid(chunk_data_cache, world)
-}
-
-fn collides_with_world(chunk_data: &ChunkDataCache, position: Vec3) -> bool {
-    let half_width = PLAYER_WIDTH * 0.5;
-    let corners = [
-        Vec3::new(position.x - half_width, position.y, position.z - half_width),
-        Vec3::new(position.x + half_width, position.y, position.z - half_width),
-        Vec3::new(position.x - half_width, position.y, position.z + half_width),
-        Vec3::new(position.x + half_width, position.y, position.z + half_width),
-        Vec3::new(
-            position.x - half_width,
-            position.y + PLAYER_HEIGHT,
-            position.z - half_width,
-        ),
-        Vec3::new(
-            position.x + half_width,
-            position.y + PLAYER_HEIGHT,
-            position.z - half_width,
-        ),
-        Vec3::new(
-            position.x - half_width,
-            position.y + PLAYER_HEIGHT,
-            position.z + half_width,
-        ),
-        Vec3::new(
-            position.x + half_width,
-            position.y + PLAYER_HEIGHT,
-            position.z + half_width,
-        ),
-    ];
-
-    corners
-        .into_iter()
-        .any(|corner| is_block_solid(chunk_data, corner))
-}
-
-fn is_block_solid(chunk_data: &ChunkDataCache, world_pos: Vec3) -> bool {
-    let key = ChunkKey::from_world_pos(world_pos);
-    let Some(chunk) = chunk_data.0.get(&key) else {
-        return false;
-    };
-
-    let local = world_pos - key.world_pos();
-    if local.x < 0.0 || local.y < 0.0 || local.z < 0.0 {
-        return false;
-    }
-
-    let x = local.x.floor() as usize;
-    let y = local.y.floor() as usize;
-    let z = local.z.floor() as usize;
-    if x >= CHUNK_SIZE || y >= CHUNK_SIZE || z >= CHUNK_SIZE {
-        return false;
-    }
-
-    chunk[chunk_index(x, y, z)] != 0
 }
 
 fn spawn_panel(

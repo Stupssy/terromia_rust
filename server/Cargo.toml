@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 shared = { path = "../shared" }
-tokio = { version = "1.52.1", features = ["macros", "time"] }
+tokio = { version = "1.52.1", features = ["macros", "time", "rt"] }
 renet = "2.0.0"
 renet_netcode = "2.0.0"
 glam = "0.30.10"
