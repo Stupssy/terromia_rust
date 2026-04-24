@@ -1,9 +1,13 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::math::IVec3;
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
+use bevy::window::CursorGrabMode;
+use bevy::window::CursorOptions;
 use bevy::window::PrimaryWindow;
 use bevy_renet::client_connected;
 use bevy_renet::netcode::{
@@ -78,6 +82,12 @@ struct ChunkDataCache(HashMap<ChunkKey, Vec<u8>>);
 
 #[derive(Resource)]
 struct DiscoveryInbox(Mutex<Receiver<DiscoveredServer>>);
+
+#[derive(Resource, Default)]
+struct CameraState {
+    yaw: f32,
+    pitch: f32,
+}
 
 #[derive(Clone)]
 struct DiscoveredServer {
@@ -176,6 +186,7 @@ fn main() {
         .init_resource::<ChatState>()
         .init_resource::<WorldCache>()
         .init_resource::<ChunkDataCache>()
+        .init_resource::<CameraState>()
         .init_resource::<HudEntities>()
         .add_systems(Startup, setup_cameras)
         .add_systems(Update, button_system)
@@ -185,6 +196,7 @@ fn main() {
         .add_systems(Update, receive_network_messages.run_if(resource_exists::<RenetClient>))
         .add_systems(Update, send_player_input.run_if(client_connected))
         .add_systems(Update, local_player_physics.run_if(in_state(AppScreen::InGame)))
+        .add_systems(Update, mouse_look.run_if(in_state(AppScreen::InGame)))
         .add_systems(Update, update_player_visuals.run_if(in_state(AppScreen::InGame)))
         .add_systems(Update, update_camera.run_if(in_state(AppScreen::InGame)))
         .add_systems(Update, toggle_runtime_panels.run_if(in_state(AppScreen::InGame)))
@@ -310,8 +322,11 @@ fn setup_world(
     mut commands: Commands,
     mut camera: Single<&mut Visibility, With<FollowCamera>>,
     mut hud: ResMut<HudEntities>,
+    mut cursor_options: Single<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     **camera = Visibility::Visible;
+    cursor_options.visible = false;
+    cursor_options.grab_mode = CursorGrabMode::Locked;
 
     let world_root = commands
         .spawn((WorldRoot, Name::new("WorldRoot")))
@@ -452,8 +467,11 @@ fn teardown_ingame(
     mut chunk_data: ResMut<ChunkDataCache>,
     mut hud: ResMut<HudEntities>,
     mut ui_state: ResMut<UiState>,
+    mut cursor_options: Single<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     **camera = Visibility::Hidden;
+    cursor_options.visible = true;
+    cursor_options.grab_mode = CursorGrabMode::None;
     for entity in &world_roots {
         commands.entity(entity).despawn();
     }
@@ -701,16 +719,25 @@ fn receive_network_messages(
             ServerMessage::ChunkData { key, data } => {
                 let chunk_vec = data.into_vec();
                 chunk_data_cache.0.insert(key, chunk_vec.clone());
-                let mesh = generate_chunk_mesh(&chunk_vec, key);
-                let entity = commands
-                    .spawn((
-                        Mesh3d(meshes.add(mesh)),
-                        MeshMaterial3d(materials.add(Color::srgb(0.25, 0.7, 0.3))),
-                        Transform::from_translation(key.world_pos()),
-                    ))
-                    .id();
-                if let Some(old) = cache.chunks.insert(key, entity) {
-                    commands.entity(old).despawn();
+                rebuild_chunk_entity(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &mut cache,
+                    &chunk_data_cache,
+                    key,
+                );
+                for neighbor in chunk_neighbors(key) {
+                    if chunk_data_cache.0.contains_key(&neighbor) {
+                        rebuild_chunk_entity(
+                            &mut commands,
+                            &mut meshes,
+                            &mut materials,
+                            &mut cache,
+                            &chunk_data_cache,
+                            neighbor,
+                        );
+                    }
                 }
             }
             ServerMessage::ServerNotice { message } => {
@@ -731,21 +758,67 @@ fn receive_network_messages(
         else {
             continue;
         };
-        connection_local_snapshot_update(&mut commands, &mut cache, players, tick);
+        connection_local_snapshot_update(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut cache,
+            connection.local_client_id,
+            players,
+            tick,
+        );
     }
 }
 
 fn connection_local_snapshot_update(
     commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
     cache: &mut WorldCache,
+    local_client_id: Option<u64>,
     players: Vec<PlayerSnapshot>,
     _tick: u32,
 ) {
+    let mut seen = HashMap::new();
     for snapshot in players {
+        seen.insert(snapshot.id, true);
         if let Some(entity) = cache.players.get(&snapshot.id).copied() {
             commands
                 .entity(entity)
-                .insert(TargetPosition(Vec3::from(snapshot.translation)));
+                .insert((
+                    TargetPosition(Vec3::from(snapshot.translation)),
+                    Name::new(snapshot.name.clone()),
+                ));
+        } else {
+            let translation = Vec3::from(snapshot.translation);
+            let material = if Some(snapshot.id) == local_client_id {
+                materials.add(Color::srgb(0.9, 0.2, 0.2))
+            } else {
+                materials.add(Color::srgb(0.2, 0.5, 0.9))
+            };
+            let mut entity = commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.8, 1.8, 0.8))),
+                MeshMaterial3d(material),
+                Transform::from_translation(translation),
+                PlayerEntity { id: snapshot.id },
+                TargetPosition(translation),
+                Name::new(snapshot.name),
+            ));
+            if Some(snapshot.id) == local_client_id {
+                entity.insert((LocalPlayer, PhysicsBody::default()));
+            }
+            cache.players.insert(snapshot.id, entity.id());
+        }
+    }
+    let stale: Vec<u64> = cache
+        .players
+        .keys()
+        .copied()
+        .filter(|id| !seen.contains_key(id))
+        .collect();
+    for id in stale {
+        if let Some(entity) = cache.players.remove(&id) {
+            commands.entity(entity).despawn();
         }
     }
 }
@@ -795,6 +868,7 @@ fn local_player_physics(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     ui_state: Res<UiState>,
+    camera_state: Res<CameraState>,
     chunk_data: Res<ChunkDataCache>,
     mut local_player: Query<(&mut Transform, &mut PhysicsBody), With<LocalPlayer>>,
 ) {
@@ -822,10 +896,12 @@ fn local_player_physics(
     if move_dir.length_squared() > 0.0 {
         move_dir = move_dir.normalize();
     }
+    let yaw_rotation = Quat::from_axis_angle(Vec3::Y, camera_state.yaw);
+    let wish_dir = yaw_rotation * move_dir;
 
     let speed = 8.5;
-    body.velocity.x = move_dir.x * speed;
-    body.velocity.z = move_dir.z * speed;
+    body.velocity.x = wish_dir.x * speed;
+    body.velocity.z = wish_dir.z * speed;
     if keys.just_pressed(KeyCode::Space) && body.on_ground {
         body.velocity.y = 10.0;
         body.on_ground = false;
@@ -862,7 +938,7 @@ fn local_player_physics(
 
 fn update_player_visuals(
     time: Res<Time>,
-    mut query: Query<(&mut Transform, &TargetPosition)>,
+    mut query: Query<(&mut Transform, &TargetPosition), Without<LocalPlayer>>,
 ) {
     for (mut transform, target) in &mut query {
         transform.translation = transform
@@ -871,14 +947,41 @@ fn update_player_visuals(
     }
 }
 
+fn mouse_look(
+    accumulated_mouse_motion: Res<AccumulatedMouseMotion>,
+    ui_state: Res<UiState>,
+    mut camera_state: ResMut<CameraState>,
+    mut cursor_options: Single<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    if ui_state.pause_open || ui_state.chat_open {
+        cursor_options.visible = true;
+        cursor_options.grab_mode = CursorGrabMode::None;
+        return;
+    }
+
+    cursor_options.visible = false;
+    cursor_options.grab_mode = CursorGrabMode::Locked;
+    let delta = accumulated_mouse_motion.delta;
+    if delta == Vec2::ZERO {
+        return;
+    }
+
+    let sensitivity = 0.0025;
+    camera_state.yaw -= delta.x * sensitivity;
+    camera_state.pitch = (camera_state.pitch - delta.y * sensitivity).clamp(-1.5, 1.5);
+}
+
 fn update_camera(
     mut camera: Single<&mut Transform, (With<FollowCamera>, Without<LocalPlayer>)>,
     local_player: Query<&Transform, With<LocalPlayer>>,
+    camera_state: Res<CameraState>,
 ) {
     if let Ok(player) = local_player.single() {
-        let target = player.translation + Vec3::new(-10.0, 14.0, 12.0);
-        camera.translation = camera.translation.lerp(target, 0.15);
-        camera.look_at(player.translation, Vec3::Y);
+        let eye = player.translation + Vec3::new(0.0, PLAYER_HEIGHT * 0.9, 0.0);
+        let rotation =
+            Quat::from_axis_angle(Vec3::Y, camera_state.yaw) * Quat::from_axis_angle(Vec3::X, camera_state.pitch);
+        camera.translation = eye;
+        camera.rotation = rotation;
     }
 }
 
@@ -1157,7 +1260,50 @@ fn spawn_discovery_thread() -> Receiver<DiscoveredServer> {
     rx
 }
 
-fn generate_chunk_mesh(data: &[u8], _key: ChunkKey) -> Mesh {
+fn rebuild_chunk_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    cache: &mut WorldCache,
+    chunk_data_cache: &ChunkDataCache,
+    key: ChunkKey,
+) {
+    let Some(chunk) = chunk_data_cache.0.get(&key) else {
+        return;
+    };
+    let mesh = generate_chunk_mesh_with_neighbors(chunk_data_cache, key, chunk);
+    let entity = commands
+        .spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(0.35, 0.72, 0.38),
+                perceptual_roughness: 0.95,
+                ..default()
+            })),
+            Transform::from_translation(key.world_pos()),
+        ))
+        .id();
+    if let Some(old) = cache.chunks.insert(key, entity) {
+        commands.entity(old).despawn();
+    }
+}
+
+fn chunk_neighbors(key: ChunkKey) -> [ChunkKey; 6] {
+    [
+        ChunkKey(key.0 + IVec3::new(1, 0, 0)),
+        ChunkKey(key.0 + IVec3::new(-1, 0, 0)),
+        ChunkKey(key.0 + IVec3::new(0, 1, 0)),
+        ChunkKey(key.0 + IVec3::new(0, -1, 0)),
+        ChunkKey(key.0 + IVec3::new(0, 0, 1)),
+        ChunkKey(key.0 + IVec3::new(0, 0, -1)),
+    ]
+}
+
+fn generate_chunk_mesh_with_neighbors(
+    chunk_data_cache: &ChunkDataCache,
+    key: ChunkKey,
+    data: &[u8],
+) -> Mesh {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut indices = Vec::new();
@@ -1175,32 +1321,32 @@ fn generate_chunk_mesh(data: &[u8], _key: ChunkKey) -> Mesh {
 
                 let faces = [
                     (
-                        is_air(data, x as isize, y as isize + 1, z as isize),
+                        is_air_world(chunk_data_cache, key, x as isize, y as isize + 1, z as isize),
                         [[fx, fy + 1.0, fz], [fx + 1.0, fy + 1.0, fz], [fx + 1.0, fy + 1.0, fz + 1.0], [fx, fy + 1.0, fz + 1.0]],
                         [0.0, 1.0, 0.0],
                     ),
                     (
-                        is_air(data, x as isize, y as isize - 1, z as isize),
+                        is_air_world(chunk_data_cache, key, x as isize, y as isize - 1, z as isize),
                         [[fx, fy, fz + 1.0], [fx + 1.0, fy, fz + 1.0], [fx + 1.0, fy, fz], [fx, fy, fz]],
                         [0.0, -1.0, 0.0],
                     ),
                     (
-                        is_air(data, x as isize + 1, y as isize, z as isize),
+                        is_air_world(chunk_data_cache, key, x as isize + 1, y as isize, z as isize),
                         [[fx + 1.0, fy, fz], [fx + 1.0, fy, fz + 1.0], [fx + 1.0, fy + 1.0, fz + 1.0], [fx + 1.0, fy + 1.0, fz]],
                         [1.0, 0.0, 0.0],
                     ),
                     (
-                        is_air(data, x as isize - 1, y as isize, z as isize),
+                        is_air_world(chunk_data_cache, key, x as isize - 1, y as isize, z as isize),
                         [[fx, fy, fz + 1.0], [fx, fy, fz], [fx, fy + 1.0, fz], [fx, fy + 1.0, fz + 1.0]],
                         [-1.0, 0.0, 0.0],
                     ),
                     (
-                        is_air(data, x as isize, y as isize, z as isize + 1),
+                        is_air_world(chunk_data_cache, key, x as isize, y as isize, z as isize + 1),
                         [[fx + 1.0, fy, fz + 1.0], [fx, fy, fz + 1.0], [fx, fy + 1.0, fz + 1.0], [fx + 1.0, fy + 1.0, fz + 1.0]],
                         [0.0, 0.0, 1.0],
                     ),
                     (
-                        is_air(data, x as isize, y as isize, z as isize - 1),
+                        is_air_world(chunk_data_cache, key, x as isize, y as isize, z as isize - 1),
                         [[fx, fy, fz], [fx + 1.0, fy, fz], [fx + 1.0, fy + 1.0, fz], [fx, fy + 1.0, fz]],
                         [0.0, 0.0, -1.0],
                     ),
@@ -1229,17 +1375,15 @@ fn generate_chunk_mesh(data: &[u8], _key: ChunkKey) -> Mesh {
     mesh
 }
 
-fn is_air(data: &[u8], x: isize, y: isize, z: isize) -> bool {
-    if x < 0 || y < 0 || z < 0 {
-        return true;
-    }
-    let x = x as usize;
-    let y = y as usize;
-    let z = z as usize;
-    if x >= CHUNK_SIZE || y >= CHUNK_SIZE || z >= CHUNK_SIZE {
-        return true;
-    }
-    data[chunk_index(x, y, z)] == 0
+fn is_air_world(
+    chunk_data_cache: &ChunkDataCache,
+    key: ChunkKey,
+    x: isize,
+    y: isize,
+    z: isize,
+) -> bool {
+    let world = key.world_pos() + Vec3::new(x as f32, y as f32, z as f32);
+    !is_block_solid(chunk_data_cache, world)
 }
 
 fn collides_with_world(chunk_data: &ChunkDataCache, position: Vec3) -> bool {
