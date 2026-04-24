@@ -6,8 +6,8 @@ use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_netcode::{NetcodeServerTransport, ServerAuthentication, ServerConfig};
 use shared::{
     chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, PlayerSnapshot,
-    ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, PLAYER_HEIGHT, PROTOCOL_ID,
-    TICK_RATE,
+    ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, GRAVITY, PLAYER_HEIGHT,
+    PROTOCOL_ID, TICK_RATE,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -53,7 +53,9 @@ struct Player {
     name: String,
     translation: Vec3,
     last_input: InputFlags,
+    prev_input: InputFlags,
     known_chunks: HashSet<ChunkKey>,
+    velocity: Vec3,
 }
 
 struct World {
@@ -127,8 +129,16 @@ impl World {
 
     fn update(&mut self, dt: f32) -> Vec<PlayerSnapshot> {
         let perlin = self.perlin;
-        for player in self.players.values_mut() {
+        let mut snapshots = Vec::new();
+
+        // Collect player IDs to avoid borrowing self multiple times
+        let player_ids: Vec<u64> = self.players.keys().cloned().collect();
+
+        for id in player_ids {
+            let player = self.players.get_mut(&id).unwrap();
             let move_speed = 8.0 * dt;
+
+            // X/Z movement from input
             if player.last_input.contains(InputFlags::FORWARD) {
                 player.translation.z -= move_speed;
             }
@@ -142,22 +152,54 @@ impl World {
                 player.translation.x += move_speed;
             }
 
-            player.translation.y =
-                (perlin.get([player.translation.x as f64 * 0.04, player.translation.z as f64 * 0.04])
-                    * 6.0
+            // Y-axis: Apply gravity
+            player.velocity.y -= GRAVITY * dt;
+
+            // Jump processing (only when newly pressed)
+            let jump_pressed = player.last_input.contains(InputFlags::JUMP)
+                && !player.prev_input.contains(InputFlags::JUMP);
+            if jump_pressed {
+                let ground_y = (perlin.get([
+                    player.translation.x as f64 * 0.04,
+                    player.translation.z as f64 * 0.04,
+                ]) * 6.0
                     + 10.0) as f32
                     + PLAYER_HEIGHT
                     + 0.5;
-        }
+                let is_grounded = (player.translation.y - ground_y).abs() < 0.2;
+                if is_grounded {
+                    player.velocity.y = 10.0;
+                }
+            }
 
-        self.players
-            .values()
-            .map(|player| PlayerSnapshot {
+            // Apply Y velocity
+            player.translation.y += player.velocity.y * dt;
+
+            // Ground collision
+            let ground_y = (perlin.get([
+                player.translation.x as f64 * 0.04,
+                player.translation.z as f64 * 0.04,
+            ]) * 6.0
+                + 10.0) as f32
+                + PLAYER_HEIGHT
+                + 0.5;
+            if player.translation.y < ground_y {
+                player.translation.y = ground_y;
+                player.velocity.y = 0.0;
+            }
+
+            // Update previous input
+            player.prev_input = player.last_input;
+
+            // Collect snapshot
+            snapshots.push(PlayerSnapshot {
                 id: player.id,
                 name: player.name.clone(),
                 translation: player.translation.to_array(),
-            })
-            .collect()
+            });
+        }
+
+        snapshots
     }
 }
 
@@ -167,10 +209,7 @@ struct DiscoveryService {
 }
 
 impl DiscoveryService {
-    fn start(
-        discovery_port: u16,
-        summary: Arc<Mutex<ServerSummary>>,
-    ) -> io::Result<Self> {
+    fn start(discovery_port: u16, summary: Arc<Mutex<ServerSummary>>) -> io::Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port))?;
         socket.set_read_timeout(Some(Duration::from_millis(250)))?;
 
@@ -181,7 +220,8 @@ impl DiscoveryService {
             while !thread_stop.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buffer) {
                     Ok((size, source)) => {
-                        let Ok(message) = bincode::deserialize::<DiscoveryMessage>(&buffer[..size]) else {
+                        let Ok(message) = bincode::deserialize::<DiscoveryMessage>(&buffer[..size])
+                        else {
                             continue;
                         };
                         if let DiscoveryMessage::Probe { protocol_id } = message {
@@ -280,7 +320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         name: format!("Player{client_id}"),
                         translation: spawn,
                         last_input: InputFlags::default(),
+                        prev_input: InputFlags::default(),
                         known_chunks: HashSet::new(),
+                        velocity: Vec3::ZERO,
                     };
                     world.players.insert(client_id, player.clone());
                     sync_summary(&summary, &server, &config);
@@ -353,7 +395,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for client_id in server.clients_id() {
-            while let Some(message) = server.receive_message(client_id, DefaultChannel::ReliableOrdered)
+            while let Some(message) =
+                server.receive_message(client_id, DefaultChannel::ReliableOrdered)
             {
                 let Ok(message) = bincode::deserialize::<ClientMessage>(&message) else {
                     continue;
@@ -377,7 +420,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     reason: Some("Replaced by reconnection".to_string()),
                                 })?,
                             );
-                            info!("Cleaned up stale player {stale_id} (reconnect as '{sanitized}')");
+                            info!(
+                                "Cleaned up stale player {stale_id} (reconnect as '{sanitized}')"
+                            );
                         }
 
                         if let Some(player) = world.players.get_mut(&client_id) {
@@ -483,10 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick,
             players: world.update(dt.as_secs_f32()),
         };
-        server.broadcast_message(
-            DefaultChannel::Unreliable,
-            bincode::serialize(&snapshot)?,
-        );
+        server.broadcast_message(DefaultChannel::Unreliable, bincode::serialize(&snapshot)?);
 
         transport.send_packets(&mut server);
 
@@ -615,7 +657,11 @@ fn handle_admin_command(command: AdminCommand, server: &mut RenetServer, world: 
             for player in world.players.values() {
                 info!(
                     "Player {} '{}' at ({:.1}, {:.1}, {:.1})",
-                    player.id, player.name, player.translation.x, player.translation.y, player.translation.z
+                    player.id,
+                    player.name,
+                    player.translation.x,
+                    player.translation.y,
+                    player.translation.z
                 );
             }
         }

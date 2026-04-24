@@ -16,9 +16,9 @@ use bevy_renet::netcode::{
 use bevy_renet::renet::{ConnectionConfig, DefaultChannel};
 use bevy_renet::{RenetClient, RenetClientPlugin};
 use shared::{
-    chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, PlayerSnapshot,
-    ServerMessage, ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, GRAVITY,
-    PLAYER_HEIGHT, PLAYER_WIDTH, PROTOCOL_ID,
+    chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, ServerMessage,
+    ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, GRAVITY, PLAYER_HEIGHT,
+    PLAYER_WIDTH, PROTOCOL_ID,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -705,6 +705,7 @@ fn receive_network_messages(
     mut connection: ResMut<ConnectionState>,
     mut menu: ResMut<MenuState>,
     mut chat: ResMut<ChatState>,
+    local_player_transform: Query<(Entity, &Transform), With<LocalPlayer>>,
 ) {
     while let Some(message) = client.receive_message(DefaultChannel::ReliableOrdered) {
         let Ok(message) = bincode::deserialize::<ServerMessage>(&message) else {
@@ -799,70 +800,68 @@ fn receive_network_messages(
     }
 
     while let Some(message) = client.receive_message(DefaultChannel::Unreliable) {
-        let Ok(ServerMessage::StateSnapshot { tick, players }) =
+        let Ok(ServerMessage::StateSnapshot { tick: _, players }) =
             bincode::deserialize::<ServerMessage>(&message)
         else {
             continue;
         };
-        connection_local_snapshot_update(
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut cache,
-            connection.local_client_id,
-            players,
-            tick,
-        );
-    }
-}
 
-fn connection_local_snapshot_update(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
-    cache: &mut WorldCache,
-    local_client_id: Option<u64>,
-    players: Vec<PlayerSnapshot>,
-    _tick: u32,
-) {
-    let mut seen = HashMap::new();
-    for snapshot in players {
-        seen.insert(snapshot.id, true);
-        if let Some(entity) = cache.players.get(&snapshot.id).copied() {
-            commands.entity(entity).insert((
-                TargetPosition(Vec3::from(snapshot.translation)),
-                Name::new(snapshot.name.clone()),
-            ));
-        } else {
-            let translation = Vec3::from(snapshot.translation);
-            let material = if Some(snapshot.id) == local_client_id {
-                materials.add(Color::srgb(0.9, 0.2, 0.2))
+        // Get local player transform for snap-to check
+        let local_player_info = local_player_transform.single().ok();
+
+        let mut seen = HashMap::new();
+        for snapshot in players {
+            seen.insert(snapshot.id, true);
+            let server_pos = Vec3::from(snapshot.translation);
+
+            if let Some(entity) = cache.players.get(&snapshot.id).copied() {
+                if Some(snapshot.id) == connection.local_client_id {
+                    // Local player: apply snap-to threshold
+                    if let Some((_entity, transform)) = local_player_info {
+                        let delta = (server_pos - transform.translation).length();
+                        if delta > 0.5 {
+                            // Snap to server position
+                            commands
+                                .entity(entity)
+                                .insert(Transform::from_translation(server_pos));
+                        }
+                    }
+                } else {
+                    // Remote player: update TargetPosition
+                    commands.entity(entity).insert(TargetPosition(server_pos));
+                }
             } else {
-                materials.add(Color::srgb(0.2, 0.5, 0.9))
-            };
-            let mut entity = commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.8, 1.8, 0.8))),
-                MeshMaterial3d(material),
-                Transform::from_translation(translation),
-                PlayerEntity { id: snapshot.id },
-                TargetPosition(translation),
-                Name::new(snapshot.name),
-            ));
-            if Some(snapshot.id) == local_client_id {
-                entity.insert((LocalPlayer, PhysicsBody::default()));
+                // New player
+                let material = if Some(snapshot.id) == connection.local_client_id {
+                    materials.add(Color::srgb(0.9, 0.2, 0.2))
+                } else {
+                    materials.add(Color::srgb(0.2, 0.5, 0.9))
+                };
+                let mut entity = commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.8, 1.8, 0.8))),
+                    MeshMaterial3d(material),
+                    Transform::from_translation(server_pos),
+                    PlayerEntity { id: snapshot.id },
+                    TargetPosition(server_pos),
+                    Name::new(snapshot.name.clone()),
+                ));
+                if Some(snapshot.id) == connection.local_client_id {
+                    entity.insert((LocalPlayer, PhysicsBody::default()));
+                }
+                cache.players.insert(snapshot.id, entity.id());
             }
-            cache.players.insert(snapshot.id, entity.id());
         }
-    }
-    let stale: Vec<u64> = cache
-        .players
-        .keys()
-        .copied()
-        .filter(|id| !seen.contains_key(id))
-        .collect();
-    for id in stale {
-        if let Some(entity) = cache.players.remove(&id) {
-            commands.entity(entity).despawn();
+
+        let stale: Vec<u64> = cache
+            .players
+            .keys()
+            .copied()
+            .filter(|id| !seen.contains_key(id))
+            .collect();
+        for id in stale {
+            if let Some(entity) = cache.players.remove(&id) {
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
