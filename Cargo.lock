@@ -4789,6 +4789,7 @@ dependencies = [
  "bincode",
  "bitflags 2.11.1",
  "glam",
+ "once_cell",
  "serde",
 ]
 

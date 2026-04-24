@@ -4,7 +4,7 @@ use crate::LocalPlayer;
 use crate::UiState;
 use bevy::prelude::*;
 use shared::ChunkKey;
-use shared::{GRAVITY, PLAYER_HEIGHT, PLAYER_WIDTH};
+use shared::{GRAVITY, PLAYER_HEIGHT, PLAYER_WIDTH, is_solid};
 
 #[derive(Component)]
 pub struct PhysicsBody {
@@ -149,7 +149,8 @@ pub fn is_block_solid(cache: &ChunkDataCache, world_pos: Vec3) -> bool {
 
         if local_x < 16 && local_y < 16 && local_z < 16 {
             let idx = local_x + local_y * 16 + local_z * 256;
-            return chunk_data[idx] != 0;
+            let block_id = chunk_data[idx] as u32;
+            return is_solid(block_id);
         }
     }
     false

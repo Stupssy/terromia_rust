@@ -1,3 +1,7 @@
+pub mod blocks;
+
+pub use blocks::{BlockDefinition, BlockKey, BLOCK_DEFINITIONS, blocks, is_solid};
+
 use bitflags::bitflags;
 use glam::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};

@@ -20,3 +20,6 @@ target/
 .kilo/
 .kilocode/
 *.lock
+
+# nodejs project
+terromia/

@@ -5,9 +5,9 @@ use noise::{NoiseFn, Perlin};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_netcode::{NetcodeServerTransport, ServerAuthentication, ServerConfig};
 use shared::{
-    chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, PlayerSnapshot,
-    ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, GRAVITY, PLAYER_HEIGHT,
-    PROTOCOL_ID, TICK_RATE,
+    blocks, BlockKey, chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags,
+    PlayerSnapshot, ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, GRAVITY,
+    PLAYER_HEIGHT, PROTOCOL_ID, TICK_RATE,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -575,6 +575,10 @@ fn generate_chunk_data(perlin: &Perlin, key: ChunkKey) -> Vec<u8> {
     let mut data = vec![0_u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
     let base = key.0 * CHUNK_SIZE as i32;
 
+    let grass_id = blocks().get(&BlockKey::Grass).copied().unwrap_or(1);
+    let dirt_id = blocks().get(&BlockKey::Dirt).copied().unwrap_or(2);
+    let stone_id = blocks().get(&BlockKey::Stone).copied().unwrap_or(3);
+
     for x in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             let wx = (base.x + x as i32) as f64;
@@ -584,7 +588,13 @@ fn generate_chunk_data(perlin: &Perlin, key: ChunkKey) -> Vec<u8> {
             for y in 0..CHUNK_SIZE {
                 let wy = base.y + y as i32;
                 if wy <= height {
-                    data[chunk_index(x, y, z)] = 1;
+                    if wy == height {
+                        data[chunk_index(x, y, z)] = grass_id as u8;
+                    } else if wy > height - 3 {
+                        data[chunk_index(x, y, z)] = dirt_id as u8;
+                    } else {
+                        data[chunk_index(x, y, z)] = stone_id as u8;
+                    }
                 }
             }
         }
