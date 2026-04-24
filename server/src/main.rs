@@ -9,7 +9,7 @@ use shared::{
     ServerConfigData, ServerMessage, ServerSummary, CHUNK_SIZE, PLAYER_HEIGHT, PROTOCOL_ID,
     TICK_RATE,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -53,6 +53,7 @@ struct Player {
     name: String,
     translation: Vec3,
     last_input: InputFlags,
+    known_chunks: HashSet<ChunkKey>,
 }
 
 struct World {
@@ -81,8 +82,8 @@ impl World {
         (self.perlin.get([x as f64 * 0.04, z as f64 * 0.04]) * 6.0 + 10.0) as f32
     }
 
-    fn ensure_chunks_for_player(&mut self, player_pos: Vec3) -> Vec<(ChunkKey, Vec<u8>)> {
-        let mut generated = Vec::new();
+    /// Generate any missing chunks around `player_pos` (does NOT return data).
+    fn ensure_chunks_around(&mut self, player_pos: Vec3) {
         for x in -self.view_distance..=self.view_distance {
             for z in -self.view_distance..=self.view_distance {
                 let offset = Vec3::new(
@@ -93,12 +94,35 @@ impl World {
                 let key = ChunkKey::from_world_pos(player_pos + offset);
                 if !self.chunks.contains_key(&key) {
                     let data = generate_chunk_data(&self.perlin, key);
-                    self.chunks.insert(key, data.clone());
-                    generated.push((key, data));
+                    self.chunks.insert(key, data);
                 }
             }
         }
-        generated
+    }
+
+    /// Return all chunks within view distance that are NOT in `known`.
+    fn chunks_unknown_to(
+        &self,
+        player_pos: Vec3,
+        known: &HashSet<ChunkKey>,
+    ) -> Vec<(ChunkKey, Vec<u8>)> {
+        let mut result = Vec::new();
+        for x in -self.view_distance..=self.view_distance {
+            for z in -self.view_distance..=self.view_distance {
+                let offset = Vec3::new(
+                    x as f32 * CHUNK_SIZE as f32,
+                    0.0,
+                    z as f32 * CHUNK_SIZE as f32,
+                );
+                let key = ChunkKey::from_world_pos(player_pos + offset);
+                if !known.contains(&key) {
+                    if let Some(data) = self.chunks.get(&key) {
+                        result.push((key, data.clone()));
+                    }
+                }
+            }
+        }
+        result
     }
 
     fn update(&mut self, dt: f32) -> Vec<PlayerSnapshot> {
@@ -256,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         name: format!("Player{client_id}"),
                         translation: spawn,
                         last_input: InputFlags::default(),
+                        known_chunks: HashSet::new(),
                     };
                     world.players.insert(client_id, player.clone());
                     sync_summary(&summary, &server, &config);
@@ -268,7 +293,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     send_reliable(&mut server, client_id, &welcome);
 
+                    // Notify ALL clients about the new player (including the new client itself)
+                    let new_player_msg = ServerMessage::PlayerConnected {
+                        id: client_id,
+                        name: player.name.clone(),
+                        translation: spawn.to_array(),
+                    };
+                    server.broadcast_message(
+                        DefaultChannel::ReliableOrdered,
+                        bincode::serialize(&new_player_msg)?,
+                    );
+
+                    // Send existing players to the new client
                     for existing in world.players.values() {
+                        if existing.id == client_id {
+                            continue; // Already sent above via broadcast
+                        }
                         let message = ServerMessage::PlayerConnected {
                             id: existing.id,
                             name: existing.name.clone(),
@@ -277,7 +317,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         send_reliable(&mut server, client_id, &message);
                     }
 
-                    for (key, data) in world.ensure_chunks_for_player(spawn) {
+                    // Generate chunks around spawn, then send ALL in view distance
+                    world.ensure_chunks_around(spawn);
+                    let empty_known = HashSet::new();
+                    let chunks_to_send = world.chunks_unknown_to(spawn, &empty_known);
+                    let mut new_known = HashSet::new();
+                    for (key, data) in chunks_to_send {
+                        new_known.insert(key);
                         send_reliable(
                             &mut server,
                             client_id,
@@ -286,6 +332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 data: data.into_boxed_slice(),
                             },
                         );
+                    }
+                    if let Some(player) = world.players.get_mut(&client_id) {
+                        player.known_chunks = new_known;
                     }
                 }
                 ServerEvent::ClientDisconnected { client_id, reason } => {
@@ -311,8 +360,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match message {
                     ClientMessage::Join { player_name } => {
+                        // Clean up any stale player with the same name (reconnection)
+                        let sanitized = sanitize_name(player_name);
+                        let stale_ids: Vec<u64> = world
+                            .players
+                            .iter()
+                            .filter(|(&id, p)| id != client_id && p.name == sanitized)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        for stale_id in stale_ids {
+                            world.players.remove(&stale_id);
+                            server.broadcast_message(
+                                DefaultChannel::ReliableOrdered,
+                                bincode::serialize(&ServerMessage::PlayerDisconnected {
+                                    id: stale_id,
+                                    reason: Some("Replaced by reconnection".to_string()),
+                                })?,
+                            );
+                            info!("Cleaned up stale player {stale_id} (reconnect as '{sanitized}')");
+                        }
+
                         if let Some(player) = world.players.get_mut(&client_id) {
-                            player.name = sanitize_name(player_name);
+                            player.name = sanitized;
                             let joined = ServerMessage::PlayerConnected {
                                 id: player.id,
                                 name: player.name.clone(),
@@ -331,22 +400,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     ClientMessage::Input { flags, .. } => {
-                        let player_translation = if let Some(player) = world.players.get_mut(&client_id) {
+                        if let Some(player) = world.players.get_mut(&client_id) {
                             player.last_input = flags;
-                            Some(player.translation)
-                        } else {
-                            None
-                        };
-                        if let Some(player_translation) = player_translation {
-                            for (key, data) in world.ensure_chunks_for_player(player_translation) {
-                                server.broadcast_message(
-                                    DefaultChannel::ReliableOrdered,
-                                    bincode::serialize(&ServerMessage::ChunkData {
-                                        key,
-                                        data: data.into_boxed_slice(),
-                                    })?,
-                                );
-                            }
                         }
                     }
                     ClientMessage::Chat { message } => {
@@ -361,6 +416,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
+                    ClientMessage::Disconnect => {
+                        info!("Client {client_id} sent disconnect");
+                        world.players.remove(&client_id);
+                        sync_summary(&summary, &server, &config);
+                        server.broadcast_message(
+                            DefaultChannel::ReliableOrdered,
+                            bincode::serialize(&ServerMessage::PlayerDisconnected {
+                                id: client_id,
+                                reason: Some("Client disconnected".to_string()),
+                            })?,
+                        );
+                        server.disconnect(client_id);
+                    }
                 }
             }
         }
@@ -369,6 +437,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             running = handle_admin_command(command, &mut server, &world);
             if !running {
                 break;
+            }
+        }
+
+        // Dynamic chunk generation: ensure chunks exist & send new ones per-client
+        {
+            // Collect positions first to avoid borrow conflict
+            let player_positions: Vec<(u64, Vec3)> = world
+                .players
+                .iter()
+                .map(|(&id, p)| (id, p.translation))
+                .collect();
+
+            // Generate any missing chunks around all players
+            for &(_, pos) in &player_positions {
+                world.ensure_chunks_around(pos);
+            }
+
+            // Send each client only the chunks they haven't seen yet
+            for &(cid, pos) in &player_positions {
+                let known = world
+                    .players
+                    .get(&cid)
+                    .map(|p| p.known_chunks.clone())
+                    .unwrap_or_default();
+                let new_chunks = world.chunks_unknown_to(pos, &known);
+                for (key, data) in new_chunks {
+                    if let Some(player) = world.players.get_mut(&cid) {
+                        player.known_chunks.insert(key);
+                    }
+                    send_reliable(
+                        &mut server,
+                        cid,
+                        &ServerMessage::ChunkData {
+                            key,
+                            data: data.into_boxed_slice(),
+                        },
+                    );
+                }
             }
         }
 

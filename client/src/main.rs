@@ -16,9 +16,9 @@ use bevy_renet::netcode::{
 use bevy_renet::renet::{ConnectionConfig, DefaultChannel};
 use bevy_renet::{RenetClient, RenetClientPlugin};
 use shared::{
-    chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, PlayerSnapshot, ServerMessage,
-    ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, GRAVITY, PLAYER_HEIGHT,
-    PLAYER_WIDTH, PROTOCOL_ID,
+    chunk_index, ChunkKey, ClientMessage, DiscoveryMessage, InputFlags, PlayerSnapshot,
+    ServerMessage, ServerSummary, CHUNK_SIZE, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, GRAVITY,
+    PLAYER_HEIGHT, PLAYER_WIDTH, PROTOCOL_ID,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -192,14 +192,29 @@ fn main() {
         .add_systems(Update, button_system)
         .add_systems(Update, collect_discovery_results)
         .add_systems(Update, text_input_system)
-        .add_systems(Update, connecting_state_system.run_if(in_state(AppScreen::Connecting)))
-        .add_systems(Update, receive_network_messages.run_if(resource_exists::<RenetClient>))
+        .add_systems(
+            Update,
+            connecting_state_system.run_if(in_state(AppScreen::Connecting)),
+        )
+        .add_systems(
+            Update,
+            receive_network_messages.run_if(resource_exists::<RenetClient>),
+        )
         .add_systems(Update, send_player_input.run_if(client_connected))
-        .add_systems(Update, local_player_physics.run_if(in_state(AppScreen::InGame)))
+        .add_systems(
+            Update,
+            local_player_physics.run_if(in_state(AppScreen::InGame)),
+        )
         .add_systems(Update, mouse_look.run_if(in_state(AppScreen::InGame)))
-        .add_systems(Update, update_player_visuals.run_if(in_state(AppScreen::InGame)))
+        .add_systems(
+            Update,
+            update_player_visuals.run_if(in_state(AppScreen::InGame)),
+        )
         .add_systems(Update, update_camera.run_if(in_state(AppScreen::InGame)))
-        .add_systems(Update, toggle_runtime_panels.run_if(in_state(AppScreen::InGame)))
+        .add_systems(
+            Update,
+            toggle_runtime_panels.run_if(in_state(AppScreen::InGame)),
+        )
         .add_systems(Update, update_hud.run_if(in_state(AppScreen::InGame)))
         .add_systems(OnEnter(AppScreen::MainMenu), spawn_main_menu)
         .add_systems(OnEnter(AppScreen::JoinByIp), spawn_join_by_ip_screen)
@@ -218,9 +233,19 @@ fn main() {
 }
 
 fn setup_cameras(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 1, // UI camera renders on top of the 3D camera
+            ..default()
+        },
+    ));
     commands.spawn((
         Camera3d::default(),
+        Camera {
+            order: 0,
+            ..default()
+        },
         Transform::from_xyz(-12.0, 18.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         Visibility::Hidden,
         FollowCamera,
@@ -243,50 +268,62 @@ fn spawn_main_menu(mut commands: Commands, menu_state: Res<MenuState>) {
 
 fn spawn_join_by_ip_screen(mut commands: Commands, menu_state: Res<MenuState>) {
     commands.spawn(screen_root()).with_children(|parent| {
-        spawn_panel(parent, "Join by IP", Some("Enter a LAN or direct server address"), |parent| {
-            parent.spawn(text_line(format!(
-                "Player Name [{}]: {}",
-                focus_marker(menu_state.focused == FocusedField::PlayerName),
-                display_or_placeholder(&menu_state.player_name, "Player")
-            )));
-            parent.spawn(button_line("Edit Name".to_string(), UiAction::OpenJoinByIp));
-            parent.spawn(text_line(format!(
-                "Server IP:Port [{}]: {}",
-                focus_marker(menu_state.focused == FocusedField::IpAddress),
-                display_or_placeholder(&menu_state.ip_address, "127.0.0.1:5000")
-            )));
-            spawn_button(parent, "Connect", UiAction::ConnectByIp);
-            spawn_button(parent, "Back", UiAction::BackToMenu);
-            parent.spawn(text_line(
-                "Press Tab to switch fields. Type directly once focused.".to_string(),
-            ));
-        });
+        spawn_panel(
+            parent,
+            "Join by IP",
+            Some("Enter a LAN or direct server address"),
+            |parent| {
+                parent.spawn(text_line(format!(
+                    "Player Name [{}]: {}",
+                    focus_marker(menu_state.focused == FocusedField::PlayerName),
+                    display_or_placeholder(&menu_state.player_name, "Player")
+                )));
+                parent.spawn(button_line("Edit Name".to_string(), UiAction::OpenJoinByIp));
+                parent.spawn(text_line(format!(
+                    "Server IP:Port [{}]: {}",
+                    focus_marker(menu_state.focused == FocusedField::IpAddress),
+                    display_or_placeholder(&menu_state.ip_address, "127.0.0.1:5000")
+                )));
+                spawn_button(parent, "Connect", UiAction::ConnectByIp);
+                spawn_button(parent, "Back", UiAction::BackToMenu);
+                parent.spawn(text_line(
+                    "Press Tab to switch fields. Type directly once focused.".to_string(),
+                ));
+            },
+        );
     });
 }
 
 fn spawn_server_browser(mut commands: Commands, browser: Res<BrowserState>) {
     commands.spawn(screen_root()).with_children(|parent| {
-        spawn_panel(parent, "LAN Browser", Some("Auto-discovers servers on the local network"), |parent| {
-            if browser.servers.is_empty() {
-                parent.spawn(text_line("No servers discovered yet. Waiting for broadcast replies...".to_string()));
-            } else {
-                for (index, server) in browser.servers.iter().enumerate() {
-                    spawn_button(
-                        parent,
-                        format!(
-                            "{} [{} / {}] - {} ({})",
-                            server.summary.server_name,
-                            server.summary.current_players,
-                            server.summary.max_players,
-                            server.summary.motd,
-                            server.addr
-                        ),
-                        UiAction::ConnectDiscovered(index),
-                    );
+        spawn_panel(
+            parent,
+            "LAN Browser",
+            Some("Auto-discovers servers on the local network"),
+            |parent| {
+                if browser.servers.is_empty() {
+                    parent.spawn(text_line(
+                        "No servers discovered yet. Waiting for broadcast replies...".to_string(),
+                    ));
+                } else {
+                    for (index, server) in browser.servers.iter().enumerate() {
+                        spawn_button(
+                            parent,
+                            format!(
+                                "{} [{} / {}] - {} ({})",
+                                server.summary.server_name,
+                                server.summary.current_players,
+                                server.summary.max_players,
+                                server.summary.motd,
+                                server.addr
+                            ),
+                            UiAction::ConnectDiscovered(index),
+                        );
+                    }
                 }
-            }
-            spawn_button(parent, "Back", UiAction::BackToMenu);
-        });
+                spawn_button(parent, "Back", UiAction::BackToMenu);
+            },
+        );
     });
 }
 
@@ -322,15 +359,22 @@ fn setup_world(
     mut commands: Commands,
     mut camera: Single<&mut Visibility, With<FollowCamera>>,
     mut hud: ResMut<HudEntities>,
+    mut ui_state: ResMut<UiState>,
+    mut camera_state: ResMut<CameraState>,
     mut cursor_options: Single<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    // Reset game state for clean entry (important for reconnects)
+    ui_state.pause_open = false;
+    ui_state.settings_open = false;
+    ui_state.player_list_open = false;
+    ui_state.chat_open = false;
+    *camera_state = CameraState::default();
+
     **camera = Visibility::Visible;
     cursor_options.visible = false;
     cursor_options.grab_mode = CursorGrabMode::Locked;
 
-    let world_root = commands
-        .spawn((WorldRoot, Name::new("WorldRoot")))
-        .id();
+    let world_root = commands.spawn((WorldRoot, Name::new("WorldRoot"))).id();
     commands.entity(world_root).with_children(|parent| {
         parent.spawn((
             DirectionalLight {
@@ -622,12 +666,14 @@ fn begin_connection(
     commands.insert_resource(RenetClient::new(ConnectionConfig::default()));
     commands.insert_resource(transport);
 
+    // Reset all connection and game state for a clean reconnect
     connection.current_target = Some(addr);
     connection.join_sent = false;
     connection.local_client_id = None;
     connection.connected_server_name.clear();
     connection.motd.clear();
     menu_state.reconnect_target = Some(addr);
+    menu_state.focused = FocusedField::None;
     next_screen.set(AppScreen::Connecting);
 }
 
@@ -783,12 +829,10 @@ fn connection_local_snapshot_update(
     for snapshot in players {
         seen.insert(snapshot.id, true);
         if let Some(entity) = cache.players.get(&snapshot.id).copied() {
-            commands
-                .entity(entity)
-                .insert((
-                    TargetPosition(Vec3::from(snapshot.translation)),
-                    Name::new(snapshot.name.clone()),
-                ));
+            commands.entity(entity).insert((
+                TargetPosition(Vec3::from(snapshot.translation)),
+                Name::new(snapshot.name.clone()),
+            ));
         } else {
             let translation = Vec3::from(snapshot.translation);
             let material = if Some(snapshot.id) == local_client_id {
@@ -978,8 +1022,8 @@ fn update_camera(
 ) {
     if let Ok(player) = local_player.single() {
         let eye = player.translation + Vec3::new(0.0, PLAYER_HEIGHT * 0.9, 0.0);
-        let rotation =
-            Quat::from_axis_angle(Vec3::Y, camera_state.yaw) * Quat::from_axis_angle(Vec3::X, camera_state.pitch);
+        let rotation = Quat::from_axis_angle(Vec3::Y, camera_state.yaw)
+            * Quat::from_axis_angle(Vec3::X, camera_state.pitch);
         camera.translation = eye;
         camera.rotation = rotation;
     }
@@ -1064,7 +1108,10 @@ fn update_hud(
 ) {
     if let Some(entity) = hud.fps {
         if let Ok(mut text) = texts.get_mut(entity) {
-            if let Some(fps) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FPS).and_then(|d| d.smoothed()) {
+            if let Some(fps) = diagnostics
+                .get(&FrameTimeDiagnosticsPlugin::FPS)
+                .and_then(|d| d.smoothed())
+            {
                 *text = Text::new(format!("FPS: {:.0}", fps));
             }
         }
@@ -1147,11 +1194,17 @@ fn collect_discovery_results(mut browser: ResMut<BrowserState>, inbox: Res<Disco
         return;
     };
     while let Ok(server) = receiver.try_recv() {
-        if let Some(existing) = browser.servers.iter_mut().find(|entry| entry.addr == server.addr) {
+        if let Some(existing) = browser
+            .servers
+            .iter_mut()
+            .find(|entry| entry.addr == server.addr)
+        {
             *existing = server;
         } else {
             browser.servers.push(server);
-            browser.servers.sort_by(|a, b| a.summary.server_name.cmp(&b.summary.server_name));
+            browser
+                .servers
+                .sort_by(|a, b| a.summary.server_name.cmp(&b.summary.server_name));
         }
     }
 }
@@ -1215,8 +1268,24 @@ fn handle_netcode_error(
 }
 
 fn disconnect_and_clear_network(commands: &mut Commands) {
-    commands.remove_resource::<RenetClient>();
-    commands.remove_resource::<NetcodeClientTransport>();
+    // Send explicit disconnect message so server cleans up immediately
+    commands.queue(|world: &mut bevy::prelude::World| {
+        // Queue the disconnect message
+        if let Some(mut client) = world.get_resource_mut::<RenetClient>() {
+            let message = ClientMessage::Disconnect;
+            if let Ok(bytes) = bincode::serialize(&message) {
+                client.send_message(DefaultChannel::ReliableOrdered, bytes);
+            }
+        }
+        // Flush the disconnect packet through the transport before removing resources.
+        // We must take the resources out to avoid double-borrowing world.
+        let client = world.remove_resource::<RenetClient>();
+        let transport = world.remove_resource::<NetcodeClientTransport>();
+        if let (Some(mut client), Some(mut transport)) = (client, transport) {
+            let _ = transport.send_packets(&mut client);
+        }
+        // Resources are already removed by take above
+    });
 }
 
 fn spawn_discovery_thread() -> Receiver<DiscoveredServer> {
@@ -1227,8 +1296,10 @@ fn spawn_discovery_thread() -> Receiver<DiscoveredServer> {
         };
         let _ = socket.set_broadcast(true);
         let _ = socket.set_read_timeout(Some(Duration::from_millis(300)));
-        let probe = bincode::serialize(&DiscoveryMessage::Probe { protocol_id: PROTOCOL_ID })
-            .unwrap_or_default();
+        let probe = bincode::serialize(&DiscoveryMessage::Probe {
+            protocol_id: PROTOCOL_ID,
+        })
+        .unwrap_or_default();
         let destination = SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_DISCOVERY_PORT);
         let mut buffer = [0_u8; 2048];
 
@@ -1320,34 +1391,106 @@ fn generate_chunk_mesh_with_neighbors(
                 let fz = z as f32;
 
                 let faces = [
+                    // Oben (+Y)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize, y as isize + 1, z as isize),
-                        [[fx, fy + 1.0, fz], [fx + 1.0, fy + 1.0, fz], [fx + 1.0, fy + 1.0, fz + 1.0], [fx, fy + 1.0, fz + 1.0]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize,
+                            y as isize + 1,
+                            z as isize,
+                        ),
+                        [
+                            [fx, fy + 1.0, fz],
+                            [fx, fy + 1.0, fz + 1.0],
+                            [fx + 1.0, fy + 1.0, fz + 1.0],
+                            [fx + 1.0, fy + 1.0, fz],
+                        ],
                         [0.0, 1.0, 0.0],
                     ),
+                    // Unten (-Y)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize, y as isize - 1, z as isize),
-                        [[fx, fy, fz + 1.0], [fx + 1.0, fy, fz + 1.0], [fx + 1.0, fy, fz], [fx, fy, fz]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize,
+                            y as isize - 1,
+                            z as isize,
+                        ),
+                        [
+                            [fx, fy, fz],
+                            [fx + 1.0, fy, fz],
+                            [fx + 1.0, fy, fz + 1.0],
+                            [fx, fy, fz + 1.0],
+                        ],
                         [0.0, -1.0, 0.0],
                     ),
+                    // Rechts (+X)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize + 1, y as isize, z as isize),
-                        [[fx + 1.0, fy, fz], [fx + 1.0, fy, fz + 1.0], [fx + 1.0, fy + 1.0, fz + 1.0], [fx + 1.0, fy + 1.0, fz]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize + 1,
+                            y as isize,
+                            z as isize,
+                        ),
+                        [
+                            [fx + 1.0, fy, fz],
+                            [fx + 1.0, fy + 1.0, fz],
+                            [fx + 1.0, fy + 1.0, fz + 1.0],
+                            [fx + 1.0, fy, fz + 1.0],
+                        ],
                         [1.0, 0.0, 0.0],
                     ),
+                    // Links (-X)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize - 1, y as isize, z as isize),
-                        [[fx, fy, fz + 1.0], [fx, fy, fz], [fx, fy + 1.0, fz], [fx, fy + 1.0, fz + 1.0]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize - 1,
+                            y as isize,
+                            z as isize,
+                        ),
+                        [
+                            [fx, fy, fz],
+                            [fx, fy, fz + 1.0],
+                            [fx, fy + 1.0, fz + 1.0],
+                            [fx, fy + 1.0, fz],
+                        ],
                         [-1.0, 0.0, 0.0],
                     ),
+                    // Vorne (+Z)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize, y as isize, z as isize + 1),
-                        [[fx + 1.0, fy, fz + 1.0], [fx, fy, fz + 1.0], [fx, fy + 1.0, fz + 1.0], [fx + 1.0, fy + 1.0, fz + 1.0]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize,
+                            y as isize,
+                            z as isize + 1,
+                        ),
+                        [
+                            [fx, fy, fz + 1.0],
+                            [fx + 1.0, fy, fz + 1.0],
+                            [fx + 1.0, fy + 1.0, fz + 1.0],
+                            [fx, fy + 1.0, fz + 1.0],
+                        ],
                         [0.0, 0.0, 1.0],
                     ),
+                    // Hinten (-Z)
                     (
-                        is_air_world(chunk_data_cache, key, x as isize, y as isize, z as isize - 1),
-                        [[fx, fy, fz], [fx + 1.0, fy, fz], [fx + 1.0, fy + 1.0, fz], [fx, fy + 1.0, fz]],
+                        is_air_world(
+                            chunk_data_cache,
+                            key,
+                            x as isize,
+                            y as isize,
+                            z as isize - 1,
+                        ),
+                        [
+                            [fx + 1.0, fy, fz],
+                            [fx, fy, fz],
+                            [fx, fy + 1.0, fz],
+                            [fx + 1.0, fy + 1.0, fz],
+                        ],
                         [0.0, 0.0, -1.0],
                     ),
                 ];
@@ -1358,7 +1501,14 @@ fn generate_chunk_mesh_with_neighbors(
                     }
                     positions.extend_from_slice(&face_positions);
                     normals.extend_from_slice(&[normal; 4]);
-                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                    indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
                     base += 4;
                 }
             }
@@ -1393,13 +1543,31 @@ fn collides_with_world(chunk_data: &ChunkDataCache, position: Vec3) -> bool {
         Vec3::new(position.x + half_width, position.y, position.z - half_width),
         Vec3::new(position.x - half_width, position.y, position.z + half_width),
         Vec3::new(position.x + half_width, position.y, position.z + half_width),
-        Vec3::new(position.x - half_width, position.y + PLAYER_HEIGHT, position.z - half_width),
-        Vec3::new(position.x + half_width, position.y + PLAYER_HEIGHT, position.z - half_width),
-        Vec3::new(position.x - half_width, position.y + PLAYER_HEIGHT, position.z + half_width),
-        Vec3::new(position.x + half_width, position.y + PLAYER_HEIGHT, position.z + half_width),
+        Vec3::new(
+            position.x - half_width,
+            position.y + PLAYER_HEIGHT,
+            position.z - half_width,
+        ),
+        Vec3::new(
+            position.x + half_width,
+            position.y + PLAYER_HEIGHT,
+            position.z - half_width,
+        ),
+        Vec3::new(
+            position.x - half_width,
+            position.y + PLAYER_HEIGHT,
+            position.z + half_width,
+        ),
+        Vec3::new(
+            position.x + half_width,
+            position.y + PLAYER_HEIGHT,
+            position.z + half_width,
+        ),
     ];
 
-    corners.into_iter().any(|corner| is_block_solid(chunk_data, corner))
+    corners
+        .into_iter()
+        .any(|corner| is_block_solid(chunk_data, corner))
 }
 
 fn is_block_solid(chunk_data: &ChunkDataCache, world_pos: Vec3) -> bool {

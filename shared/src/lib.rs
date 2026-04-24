@@ -98,6 +98,7 @@ pub enum ClientMessage {
     Join { player_name: String },
     Input { tick: u32, flags: InputFlags },
     Chat { message: String },
+    Disconnect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
