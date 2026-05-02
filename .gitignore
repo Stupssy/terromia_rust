@@ -24,3 +24,6 @@ target/
 # nodejs project
 terromia/
 Cargo.lock
+
+# vscode
+.vscode/

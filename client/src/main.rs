@@ -212,7 +212,7 @@ fn main() {
         .init_resource::<ChunkDataCache>()
         .init_resource::<CameraState>()
         .init_resource::<HudEntities>()
-        .add_systems(Startup, setup_cameras)
+        .add_systems(Startup, (setup_cameras, setup_world_lighting))
         .add_systems(Update, button_system)
         .add_systems(Update, collect_discovery_results)
         .add_systems(Update, text_input_system)
@@ -379,6 +379,21 @@ fn spawn_disconnected_screen(mut commands: Commands, menu: Res<MenuState>) {
     });
 }
 
+fn setup_world_lighting(mut commands: Commands) {
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 15_000.0,
+            color: Color::srgb(0.98, 0.92, 0.8),
+            shadows_enabled: true,
+            shadow_depth_bias: 0.1,
+            shadow_normal_bias: 0.05,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.2, 0.0)),
+        Name::new("WorldLight"),
+    ));
+}
+
 fn setup_world(
     mut commands: Commands,
     mut camera: Single<&mut Visibility, With<FollowCamera>>,
@@ -402,11 +417,14 @@ fn setup_world(
     commands.entity(world_root).with_children(|parent| {
         parent.spawn((
             DirectionalLight {
-                illuminance: 12_000.0,
+                illuminance: 15_000.0,
+                color: Color::srgb(0.98, 0.92, 0.8),
                 shadows_enabled: true,
+                shadow_depth_bias: 0.1,
+                shadow_normal_bias: 0.05,
                 ..default()
             },
-            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, -0.8, 0.0)),
+            Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, -0.2, 0.0)),
         ));
     });
 
